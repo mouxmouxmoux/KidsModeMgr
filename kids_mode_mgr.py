@@ -2,6 +2,7 @@
 import json
 import tkinter as tk
 from tkinter import messagebox
+import win32con
 import win32net
 import win32netcon
 import win32security
@@ -16,6 +17,7 @@ import ctypes
 from ctypes import wintypes
 import winreg
 from datetime import datetime
+import hashlib
 import sys
 import subprocess
 
@@ -30,6 +32,11 @@ REG_PATH = r"SOFTWARE\KidsModeMgr"
 ADMINISTRATORS_SID_STR = "S-1-5-32-544"
 ADMINISTRATORS_SID = win32security.ConvertStringSidToSid(ADMINISTRATORS_SID_STR)
 TOKEN_ELEVATION_TYPE_LIMITED = 3
+PASSWORD_ROTATION_DATE_FORMAT = "%Y%m%d"
+POWER_RESUME_EVENT_TYPES = {
+    win32con.PBT_APMRESUMEAUTOMATIC,
+    win32con.PBT_APMRESUMESUSPEND,
+}
 
 class WTS_SESSION_INFO(ctypes.Structure):
     _fields_ = [("SessionId", ctypes.c_uint32),
@@ -237,13 +244,84 @@ def coerce_bool(value, default):
             return False
     return bool(default)
 
+def normalize_local_username(username):
+    return str(username or "").strip()
+
+def get_local_username_from_user_key(user_key):
+    normalized_user_key = normalize_local_username(user_key)
+    if not normalized_user_key:
+        return ""
+
+    if "\\" not in normalized_user_key:
+        return normalized_user_key
+
+    domain, username = normalized_user_key.split("\\", 1)
+    local_domains = {
+        os.environ.get("COMPUTERNAME", "").strip().lower(),
+        ".",
+    }
+    if domain.strip().lower() in local_domains:
+        return username.strip()
+    return ""
+
+def validate_password_rotation_username(username):
+    normalized_username = normalize_local_username(username)
+    if not normalized_username:
+        return False, normalized_username, "请先填写需要自动改密的本地用户名。"
+
+    if "\\" in normalized_username:
+        return False, normalized_username, "自动改密目标用户必须填写本地用户名，不能使用 域\\用户名 格式。"
+
+    try:
+        win32net.NetUserGetInfo(None, normalized_username, 1)
+    except win32net.error:
+        return False, normalized_username, f"本地用户 {normalized_username} 不存在。"
+    except Exception as e:
+        return False, normalized_username, f"无法校验用户 {normalized_username}: {e}"
+
+    if is_user_key_in_admin_group(normalized_username):
+        return False, normalized_username, f"用户 {normalized_username} 属于管理员组，不能启用自动改密。"
+
+    return True, normalized_username, ""
+
+def build_password_rotation_value(now=None):
+    current_time = now or datetime.now()
+    date_key = current_time.strftime(PASSWORD_ROTATION_DATE_FORMAT)
+    password = hashlib.md5(date_key.encode("utf-8")).hexdigest()[-6:]
+    return date_key, password
+
+def create_hidden_startupinfo():
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return startupinfo
+
+def run_hidden_process(command):
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        startupinfo=create_hidden_startupinfo(),
+    )
+
+def get_subprocess_output(result):
+    return "\n".join(
+        part.strip() for part in [result.stdout, result.stderr] if part and part.strip()
+    )
+
+def get_net_executable():
+    net_executable = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "net.exe")
+    if os.path.exists(net_executable):
+        return net_executable
+    return "net"
+
 # =============================================================================
 # Service Class
 # =============================================================================
 class KidsModeService(win32serviceutil.ServiceFramework):
     _svc_name_ = "KidsModeMgrService"
     _svc_display_name_ = "Kids Mode Manager Service"
-    _svc_description_ = "监控电脑使用时间，超过限制后强制锁屏并执行休息策略。"
+    _svc_description_ = "监控电脑使用时间，支持连续使用时长和每日总时长限制。"
 
     def __init__(self, args):
         win32serviceutil.ServiceFramework.__init__(self, args)
@@ -263,6 +341,10 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         self.user_states = {}
         self.load_state()
 
+    def GetAcceptedControls(self):
+        accepted_controls = super().GetAcceptedControls()
+        return accepted_controls | win32service.SERVICE_ACCEPT_POWEREVENT
+
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         win32event.SetEvent(self.hWaitStop)
@@ -273,7 +355,20 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         servicemanager.LogMsg(servicemanager.EVENTLOG_INFORMATION_TYPE,
                               servicemanager.PYS_SERVICE_STARTED,
                               (self._svc_name_, ''))
+        try:
+            self.rotate_configured_user_password("服务启动")
+        except Exception as e:
+            servicemanager.LogInfoMsg(f"服务启动时执行自动改密失败: {e}")
         self.main()
+
+    def SvcOtherEx(self, control, event_type, data):
+        if control == win32service.SERVICE_CONTROL_POWEREVENT and event_type in POWER_RESUME_EVENT_TYPES:
+            try:
+                self.rotate_configured_user_password("系统唤醒")
+            except Exception as e:
+                servicemanager.LogInfoMsg(f"系统唤醒后执行自动改密失败: {e}")
+            return 0
+        return super().SvcOtherEx(control, event_type, data)
 
     def _get_reg_value(self, name, default):
         try:
@@ -306,12 +401,83 @@ class KidsModeService(win32serviceutil.ServiceFramework):
                 winreg.CloseKey(key)
 
     def load_config(self):
+        legacy_enable_limits = coerce_bool(self._get_reg_value("EnableRest", 1), True)
         return {
             "max_usage_seconds": coerce_non_negative_int(self._get_reg_value("MaxUsage", 1800), 1800),
             "mandatory_rest_seconds": coerce_non_negative_int(self._get_reg_value("MandatoryRest", 300), 300),
             "daily_usage_limit_seconds": coerce_non_negative_int(self._get_reg_value("DailyUsageLimit", 0), 0),
-            "enable_mandatory_rest": coerce_bool(self._get_reg_value("EnableRest", 1), True)
+            "enable_continuous_usage_limit": coerce_bool(
+                self._get_reg_value("EnableContinuousUsageLimit", int(legacy_enable_limits)),
+                legacy_enable_limits
+            ),
+            "enable_daily_usage_limit": coerce_bool(
+                self._get_reg_value("EnableDailyUsageLimit", int(legacy_enable_limits)),
+                legacy_enable_limits
+            ),
+            "password_rotation_enabled": coerce_bool(
+                self._get_reg_value("PasswordRotationEnabled", 1),
+                True
+            ),
+            "password_rotation_username": normalize_local_username(
+                self._get_reg_value("PasswordRotationUsername", "")
+            ),
         }
+
+    def rotate_password_for_username(self, username, trigger):
+        is_valid, normalized_username, validation_message = validate_password_rotation_username(username)
+        if not is_valid:
+            servicemanager.LogInfoMsg(f"{trigger}时自动改密已跳过: {validation_message}")
+            return False
+
+        date_key, password = build_password_rotation_value()
+        result = run_hidden_process([get_net_executable(), "user", normalized_username, password])
+        output = get_subprocess_output(result)
+        if result.returncode == 0:
+            servicemanager.LogInfoMsg(
+                f"{trigger}时已更新用户 {normalized_username} 的密码。日期种子: {date_key}"
+            )
+            return True
+
+        detail_suffix = f"\n{output}" if output else ""
+        servicemanager.LogInfoMsg(
+            f"{trigger}时更新用户 {normalized_username} 的密码失败，退出码 {result.returncode}。{detail_suffix}"
+        )
+        return False
+
+    def rotate_configured_user_password(self, trigger):
+        config = self.load_config()
+        if not config.get("password_rotation_enabled", True):
+            return False
+
+        return self.rotate_password_for_username(
+            config.get("password_rotation_username", ""),
+            trigger
+        )
+
+    def rotate_timed_out_user_password(self, user_key, trigger):
+        config = self.load_config()
+        if not config.get("password_rotation_enabled", True):
+            return False
+
+        local_username = get_local_username_from_user_key(user_key)
+        if not local_username:
+            servicemanager.LogInfoMsg(
+                f"{trigger}时自动改密已跳过: 超时用户 {user_key} 不是本地用户。"
+            )
+            return False
+
+        return self.rotate_password_for_username(local_username, trigger)
+
+    def enforce_daily_usage_limit(self, active_session, active_user_key, daily_usage_limit, save_state_first=False):
+        servicemanager.LogInfoMsg(f"已达到每日可用总时间 {daily_usage_limit}秒，正在执行锁屏...")
+        if save_state_first:
+            self.save_state(force=True)
+        try:
+            self.rotate_timed_out_user_password(active_user_key, "每日总时长超时")
+        except Exception as e:
+            servicemanager.LogInfoMsg(f"每日总时长超时时执行自动改密失败: {e}")
+        disconnect_session(active_session)
+        self.current_usage_seconds = 0
 
     def load_state(self):
         try:
@@ -423,7 +589,8 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         max_usage = config.get("max_usage_seconds", 1800)
         mandatory_rest = config.get("mandatory_rest_seconds", 300)
         daily_usage_limit = config.get("daily_usage_limit_seconds", 0)
-        enable_mandatory_rest = config.get("enable_mandatory_rest", True)
+        enable_continuous_usage_limit = config.get("enable_continuous_usage_limit", True)
+        enable_daily_usage_limit = config.get("enable_daily_usage_limit", True)
         current_time = time.time()
         active_session = get_active_session_id()
         active_user_key = get_session_user_key(active_session)
@@ -442,7 +609,7 @@ class KidsModeService(win32serviceutil.ServiceFramework):
 
             user_state = self._get_user_state(active_user_key)
 
-            if enable_mandatory_rest:
+            if enable_continuous_usage_limit:
                 time_since_last_lock = current_time - self.last_force_lock_time
                 if time_since_last_lock < mandatory_rest:
                     remaining_time = int(mandatory_rest - time_since_last_lock)
@@ -450,23 +617,23 @@ class KidsModeService(win32serviceutil.ServiceFramework):
                     disconnect_session(active_session)
                     return
 
-            if enable_mandatory_rest and daily_usage_limit > 0 and user_state["daily_usage_seconds"] >= daily_usage_limit:
-                servicemanager.LogInfoMsg(f"已达到每日可用总时间 {daily_usage_limit}秒，正在执行锁屏...")
-                disconnect_session(active_session)
-                self.current_usage_seconds = 0
+            if enable_daily_usage_limit and daily_usage_limit > 0 and user_state["daily_usage_seconds"] >= daily_usage_limit:
+                self.enforce_daily_usage_limit(active_session, active_user_key, daily_usage_limit)
                 return
 
             self.current_usage_seconds += 1
             user_state["daily_usage_seconds"] += 1
 
-            if enable_mandatory_rest and daily_usage_limit > 0 and user_state["daily_usage_seconds"] >= daily_usage_limit:
-                servicemanager.LogInfoMsg(f"已达到每日可用总时间 {daily_usage_limit}秒，正在执行锁屏...")
-                self.save_state(force=True)
-                disconnect_session(active_session)
-                self.current_usage_seconds = 0
+            if enable_daily_usage_limit and daily_usage_limit > 0 and user_state["daily_usage_seconds"] >= daily_usage_limit:
+                self.enforce_daily_usage_limit(
+                    active_session,
+                    active_user_key,
+                    daily_usage_limit,
+                    save_state_first=True
+                )
                 return
 
-            if enable_mandatory_rest and self.current_usage_seconds >= max_usage:
+            if enable_continuous_usage_limit and self.current_usage_seconds >= max_usage:
                 servicemanager.LogInfoMsg(f"已达到最大使用时间 {max_usage}秒，正在执行锁屏...")
                 self.last_force_lock_time = current_time
                 self.save_state(force=True)
@@ -493,7 +660,7 @@ class KidsModeManager(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("儿童模式管理工具 (Kids Mode Manager)")
-        self.geometry("460x500")
+        self.geometry("460x580")
         self.resizable(False, False)
         
         # 设置窗口图标
@@ -546,11 +713,33 @@ class KidsModeManager(tk.Tk):
         tk.Label(config_frame, text="每日可用总时间(秒, 0=不限):").grid(row=2, column=0, sticky="w", pady=8)
         self.entry_daily_usage_limit = tk.Entry(config_frame, width=25)
         self.entry_daily_usage_limit.grid(row=2, column=1, pady=8, padx=5)
+
+        tk.Label(config_frame, text="自动改密目标用户:").grid(row=3, column=0, sticky="w", pady=8)
+        self.entry_password_rotation_username = tk.Entry(config_frame, width=25)
+        self.entry_password_rotation_username.grid(row=3, column=1, pady=8, padx=5)
+
+        self.var_enable_password_rotation = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            config_frame,
+            text="开机/唤醒自动修改该用户密码",
+            variable=self.var_enable_password_rotation
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=8)
         
-        self.var_enable_rest = tk.BooleanVar()
-        tk.Checkbutton(config_frame, text="开启强制休息", variable=self.var_enable_rest).grid(row=3, column=0, columnspan=2, sticky="w", pady=8)
+        self.var_enable_continuous_usage_limit = tk.BooleanVar()
+        tk.Checkbutton(
+            config_frame,
+            text="开启连续使用时长限制",
+            variable=self.var_enable_continuous_usage_limit
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=8)
+
+        self.var_enable_daily_usage_limit = tk.BooleanVar()
+        tk.Checkbutton(
+            config_frame,
+            text="开启每日总时长限制",
+            variable=self.var_enable_daily_usage_limit
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=8)
         
-        tk.Button(config_frame, text="保存配置", command=self.save_config, width=20, bg="#f0f0f0").grid(row=4, column=0, columnspan=2, pady=10)
+        tk.Button(config_frame, text="保存配置", command=self.save_config, width=20, bg="#f0f0f0").grid(row=7, column=0, columnspan=2, pady=10)
         
         control_frame = tk.LabelFrame(self, text="服务控制", padx=15, pady=15)
         control_frame.pack(padx=15, pady=5, fill="x")
@@ -571,17 +760,36 @@ class KidsModeManager(tk.Tk):
 
     def load_config(self):
         try:
+            legacy_enable_limits = coerce_bool(self._get_reg_value("EnableRest", 1), True)
             max_usage = coerce_non_negative_int(self._get_reg_value("MaxUsage", 1800), 1800)
             mandatory_rest = coerce_non_negative_int(self._get_reg_value("MandatoryRest", 300), 300)
             daily_usage_limit = coerce_non_negative_int(self._get_reg_value("DailyUsageLimit", 0), 0)
-            enable_rest = coerce_bool(self._get_reg_value("EnableRest", 1), True)
+            password_rotation_enabled = coerce_bool(
+                self._get_reg_value("PasswordRotationEnabled", 1),
+                True
+            )
+            password_rotation_username = normalize_local_username(
+                self._get_reg_value("PasswordRotationUsername", "")
+            )
+            enable_continuous_usage_limit = coerce_bool(
+                self._get_reg_value("EnableContinuousUsageLimit", int(legacy_enable_limits)),
+                legacy_enable_limits
+            )
+            enable_daily_usage_limit = coerce_bool(
+                self._get_reg_value("EnableDailyUsageLimit", int(legacy_enable_limits)),
+                legacy_enable_limits
+            )
             self.entry_max_usage.delete(0, tk.END)
             self.entry_max_usage.insert(0, str(max_usage))
             self.entry_mandatory_rest.delete(0, tk.END)
             self.entry_mandatory_rest.insert(0, str(mandatory_rest))
             self.entry_daily_usage_limit.delete(0, tk.END)
             self.entry_daily_usage_limit.insert(0, str(daily_usage_limit))
-            self.var_enable_rest.set(enable_rest)
+            self.entry_password_rotation_username.delete(0, tk.END)
+            self.entry_password_rotation_username.insert(0, password_rotation_username)
+            self.var_enable_password_rotation.set(password_rotation_enabled)
+            self.var_enable_continuous_usage_limit.set(enable_continuous_usage_limit)
+            self.var_enable_daily_usage_limit.set(enable_daily_usage_limit)
         except Exception as e:
             messagebox.showerror("错误", f"读取配置失败: {e}")
 
@@ -592,24 +800,39 @@ class KidsModeManager(tk.Tk):
             daily_usage_limit = int(self.entry_daily_usage_limit.get())
             if max_usage < 0 or mandatory_rest < 0 or daily_usage_limit < 0:
                 raise ValueError
-            enable_rest = 1 if self.var_enable_rest.get() else 0
+            password_rotation_username = normalize_local_username(self.entry_password_rotation_username.get())
+            password_rotation_enabled = 1 if self.var_enable_password_rotation.get() else 0
+            enable_continuous_usage_limit = 1 if self.var_enable_continuous_usage_limit.get() else 0
+            enable_daily_usage_limit = 1 if self.var_enable_daily_usage_limit.get() else 0
+
+            if password_rotation_enabled:
+                is_valid, normalized_username, validation_message = validate_password_rotation_username(
+                    password_rotation_username
+                )
+                if not is_valid:
+                    raise RuntimeError(validation_message)
+                password_rotation_username = normalized_username
+
             self._set_reg_value("MaxUsage", max_usage)
             self._set_reg_value("MandatoryRest", mandatory_rest)
             self._set_reg_value("DailyUsageLimit", daily_usage_limit)
-            self._set_reg_value("EnableRest", enable_rest)
+            self._set_reg_value("PasswordRotationEnabled", password_rotation_enabled)
+            self._set_reg_value("PasswordRotationUsername", password_rotation_username, winreg.REG_SZ)
+            self._set_reg_value("EnableContinuousUsageLimit", enable_continuous_usage_limit)
+            self._set_reg_value("EnableDailyUsageLimit", enable_daily_usage_limit)
             messagebox.showinfo("成功", "配置已保存到注册表，请重启服务生效。")
         except ValueError:
             messagebox.showerror("错误", "请输入大于或等于 0 的有效数字。")
+        except RuntimeError as e:
+            messagebox.showerror("错误", str(e))
         except Exception as e:
             messagebox.showerror("错误", f"保存配置失败: {e}")
 
     def run_command(self, args, success_msg):
         cmd = get_command_prefix() + args
         try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
-            output = "\n".join(part.strip() for part in [result.stdout, result.stderr] if part.strip())
+            result = run_hidden_process(cmd)
+            output = get_subprocess_output(result)
             if result.returncode == 0:
                 if output and ("Error" in result.stdout or "Error" in result.stderr):
                     messagebox.showerror("失败", f"操作失败:\n{output}")
